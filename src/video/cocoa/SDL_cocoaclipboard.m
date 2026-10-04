@@ -216,6 +216,13 @@ static bool IsMimeType(const char *tag)
     }
 }
 
+// SDL text is UTF-8: "text/plain" and "text/plain;charset=utf-8"
+static bool IsUTF8TextMimeType(const char *mime_type)
+{
+    return SDL_strcasecmp(mime_type, "text/plain") == 0 ||
+           SDL_strcasecmp(mime_type, "text/plain;charset=utf-8") == 0;
+}
+
 static CFStringRef GetUTIType(const char *tag)
 {
     CFStringRef utiType;
@@ -235,6 +242,27 @@ void *Cocoa_GetClipboardData(SDL_VideoDevice *_this, const char *mime_type, size
         NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
         void *data = NULL;
         *size = 0;
+
+        if (IsUTF8TextMimeType(mime_type)) {
+            /* "text/plain" maps to public.plain-text, and the pasteboard returns the
+             * first conforming type, which can be UTF-16 with a BOM (for instance
+             * public.utf16-external-plain-text after copying a file in Finder).
+             * Let the pasteboard convert the text to a string instead. */
+            NSString *string = [pasteboard stringForType:NSPasteboardTypeString];
+            const char *utf8 = string ? [string UTF8String] : NULL;
+            if (utf8) {
+                *size = SDL_strlen(utf8);
+                data = SDL_malloc(*size + sizeof(Uint32));
+                if (data) {
+                    SDL_memcpy(data, utf8, *size);
+                    SDL_memset((Uint8 *)data + *size, 0, sizeof(Uint32));
+                } else {
+                    *size = 0;
+                }
+            }
+            return data;
+        }
+
         for (NSPasteboardItem *item in [pasteboard pasteboardItems]) {
             NSData *itemData;
             CFStringRef utiType = GetUTIType(mime_type);
