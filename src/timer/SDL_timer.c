@@ -411,6 +411,15 @@ bool SDL_RemoveTimer(SDL_TimerID id)
 
 #include <emscripten/emscripten.h>
 #include <emscripten/eventloop.h>
+#ifdef __EMSCRIPTEN_PTHREADS__
+#include <emscripten/proxying.h>
+#include <emscripten/threading.h>
+#endif
+
+/* A timeout belongs to the JavaScript event loop of the thread that set it: clearing it from
+   another thread does nothing, and the thread may never return to its event loop. With threads,
+   the timer map and every timeout therefore live on the main runtime thread, and the public
+   functions run their part there, so that they stay safe to call from any thread. */
 
 typedef struct SDL_TimerMap
 {
@@ -430,14 +439,51 @@ typedef struct
 
 static SDL_TimerData SDL_timer_data;
 
+// Runs func(arg) on the main runtime thread and waits for it.
+static bool SDL_Emscripten_RunOnMainThread(void (*func)(void *), void *arg)
+{
+#ifdef __EMSCRIPTEN_PTHREADS__
+    if (!emscripten_is_main_runtime_thread()) {
+        return emscripten_proxy_sync(emscripten_proxy_get_system_queue(), emscripten_main_runtime_thread_id(), func, arg) == 1;
+    }
+#endif
+    func(arg);
+    return true;
+}
+
+static SDL_TimerMap *SDL_Emscripten_FindTimer(SDL_TimerID timerID, SDL_TimerMap **prev)
+{
+    SDL_TimerData *data = &SDL_timer_data;
+    SDL_TimerMap *entry;
+
+    *prev = NULL;
+    for (entry = data->timermap; entry; *prev = entry, entry = entry->next) {
+        if (entry->timerID == timerID) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
 static void SDL_Emscripten_TimerHelper(void *userdata)
 {
     SDL_TimerMap *entry = (SDL_TimerMap *)userdata;
+    SDL_TimerMap *prev;
+    const SDL_TimerID timerID = entry->timerID;
+    Uint64 interval;
+
     if (entry->callback_ms) {
-        entry->interval = SDL_MS_TO_NS(entry->callback_ms(entry->userdata, entry->timerID, (Uint32)SDL_NS_TO_MS(entry->interval)));
+        interval = SDL_MS_TO_NS(entry->callback_ms(entry->userdata, timerID, (Uint32)SDL_NS_TO_MS(entry->interval)));
     } else {
-        entry->interval = entry->callback_ns(entry->userdata, entry->timerID, entry->interval);
+        interval = entry->callback_ns(entry->userdata, timerID, entry->interval);
     }
+
+    // The callback may have removed its own timer, which freed the entry.
+    entry = SDL_Emscripten_FindTimer(timerID, &prev);
+    if (!entry) {
+        return;
+    }
+    entry->interval = interval;
     if (entry->interval > 0) {
         entry->timeoutID = emscripten_set_timeout(&SDL_Emscripten_TimerHelper,
                                                   SDL_NS_TO_MS(entry->interval),
@@ -450,22 +496,42 @@ bool SDL_InitTimers(void)
     return true;
 }
 
-void SDL_QuitTimers(void)
+static void SDL_Emscripten_QuitTimers(void *unused)
 {
     SDL_TimerData *data = &SDL_timer_data;
     SDL_TimerMap *entry;
 
+    (void)unused;
     while (data->timermap) {
         entry = data->timermap;
         data->timermap = entry->next;
+        emscripten_clear_timeout(entry->timeoutID);
         SDL_free(entry);
     }
 }
 
-static SDL_TimerID SDL_CreateTimer(Uint64 interval, SDL_TimerCallback callback_ms, SDL_NSTimerCallback callback_ns, void *userdata)
+void SDL_QuitTimers(void)
+{
+    SDL_Emscripten_RunOnMainThread(SDL_Emscripten_QuitTimers, NULL);
+}
+
+static void SDL_Emscripten_AddTimer(void *userdata)
 {
     SDL_TimerData *data = &SDL_timer_data;
+    SDL_TimerMap *entry = (SDL_TimerMap *)userdata;
+
+    entry->timeoutID = emscripten_set_timeout(&SDL_Emscripten_TimerHelper,
+                                              SDL_NS_TO_MS(entry->interval),
+                                              entry);
+
+    entry->next = data->timermap;
+    data->timermap = entry;
+}
+
+static SDL_TimerID SDL_CreateTimer(Uint64 interval, SDL_TimerCallback callback_ms, SDL_NSTimerCallback callback_ns, void *userdata)
+{
     SDL_TimerMap *entry;
+    SDL_TimerID timerID;
 
     if (!callback_ms && !callback_ns) {
         SDL_InvalidParamError("callback");
@@ -476,20 +542,19 @@ static SDL_TimerID SDL_CreateTimer(Uint64 interval, SDL_TimerCallback callback_m
     if (!entry) {
         return 0;
     }
-    entry->timerID = SDL_GetNextObjectID();
+    timerID = entry->timerID = SDL_GetNextObjectID();
     entry->callback_ms = callback_ms;
     entry->callback_ns = callback_ns;
     entry->userdata = userdata;
     entry->interval = interval;
 
-    entry->timeoutID = emscripten_set_timeout(&SDL_Emscripten_TimerHelper,
-                                              SDL_NS_TO_MS(entry->interval),
-                                              entry);
-
-    entry->next = data->timermap;
-    data->timermap = entry;
-
-    return entry->timerID;
+    // Once added, the entry belongs to the main thread: it may already have fired and been removed.
+    if (!SDL_Emscripten_RunOnMainThread(SDL_Emscripten_AddTimer, entry)) {
+        SDL_free(entry);
+        SDL_SetError("Couldn't add the timer on the main thread");
+        return 0;
+    }
+    return timerID;
 }
 
 SDL_TimerID SDL_AddTimer(Uint32 interval, SDL_TimerCallback callback, void *userdata)
@@ -502,31 +567,43 @@ SDL_TimerID SDL_AddTimerNS(Uint64 interval, SDL_NSTimerCallback callback, void *
     return SDL_CreateTimer(interval, NULL, callback, userdata);
 }
 
-bool SDL_RemoveTimer(SDL_TimerID id)
+typedef struct
+{
+    SDL_TimerID timerID;
+    bool removed;
+} SDL_TimerRemoval;
+
+static void SDL_Emscripten_RemoveTimer(void *userdata)
 {
     SDL_TimerData *data = &SDL_timer_data;
+    SDL_TimerRemoval *removal = (SDL_TimerRemoval *)userdata;
     SDL_TimerMap *prev, *entry;
+
+    entry = SDL_Emscripten_FindTimer(removal->timerID, &prev);
+    if (!entry) {
+        return;
+    }
+    if (prev) {
+        prev->next = entry->next;
+    } else {
+        data->timermap = entry->next;
+    }
+    emscripten_clear_timeout(entry->timeoutID);
+    SDL_free(entry);
+    removal->removed = true;
+}
+
+bool SDL_RemoveTimer(SDL_TimerID id)
+{
+    SDL_TimerRemoval removal;
 
     if (!id) {
         return SDL_InvalidParamError("id");
     }
 
-    // Find the timer
-    prev = NULL;
-    for (entry = data->timermap; entry; prev = entry, entry = entry->next) {
-        if (entry->timerID == id) {
-            if (prev) {
-                prev->next = entry->next;
-            } else {
-                data->timermap = entry->next;
-            }
-            break;
-        }
-    }
-
-    if (entry) {
-        emscripten_clear_timeout(entry->timeoutID);
-        SDL_free(entry);
+    removal.timerID = id;
+    removal.removed = false;
+    if (SDL_Emscripten_RunOnMainThread(SDL_Emscripten_RemoveTimer, &removal) && removal.removed) {
         return true;
     } else {
         return SDL_SetError("Timer not found");
