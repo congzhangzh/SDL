@@ -927,7 +927,9 @@ static void Emscripten_set_drag_event_callbacks(SDL_WindowData *data)
             target.addEventListener("dragover", SDL3.eventHandlerDropDragover);
 
             SDL3.drop_count = 0;
-            FS.mkdir("/tmp/filedrop");
+            // FS.* functions throw exceptions when there are errors (such as the temp dir already existing),
+            //  but we ignore all of these in a catch handler; you just won't get the drop event if there's a problem.
+            try { FS.mkdir("/tmp/filedrop"); } catch (e) {}
             SDL3.eventHandlerDropDrop = function(event) {
                 event.preventDefault();
                 if (event.dataTransfer.types.includes("text/plain")) {
